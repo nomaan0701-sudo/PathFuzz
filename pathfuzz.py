@@ -7,9 +7,11 @@ from urllib.parse import (
     urlsplit,
     urlunsplit,
     parse_qsl,
-    urlencode,
+    quote,
+    unquote_plus,
 )
 from concurrent.futures import (
+    Future,
     ThreadPoolExecutor,
     wait,
     FIRST_COMPLETED,
@@ -55,45 +57,71 @@ def load_urls(filename):
     return unique_urls, rejected
 
 
+def inspect_parameter_instances(url):
+    """Return each query parameter occurrence as (name, zero_based_index, total)."""
+    parsed = urlsplit(url)
+    parameters = parse_qsl(parsed.query, keep_blank_values=True)
+
+    totals = {}
+    for name, _value in parameters:
+        totals[name] = totals.get(name, 0) + 1
+
+    seen = {}
+    instances = []
+    for name, _value in parameters:
+        occurrence_index = seen.get(name, 0)
+        seen[name] = occurrence_index + 1
+        instances.append((name, occurrence_index, totals[name]))
+
+    return instances
+
+
 def inspect_url(url):
-    """Extract query parameter names without sending requests."""
+    """Extract unique query parameter names without sending requests."""
+    return sorted({name for name, _index, _total in inspect_parameter_instances(url)})
+
+
+def replace_parameter(url, target_parameter, test_value, occurrence_index=0):
+    """Replace one query-value occurrence while preserving intentional %XX encoding.
+
+    Payload values are treated as URL-query values: existing percent escapes in
+    the payload are preserved, while characters that could change query structure
+    (such as &, =, #, and +) are encoded. This prevents accidental double-encoding
+    of payloads like %2e%2e%2f while keeping the query string structurally valid.
+    """
+    if occurrence_index < 0:
+        raise ValueError("occurrence_index cannot be negative")
+
     parsed = urlsplit(url)
-    parameters = parse_qsl(
-        parsed.query,
-        keep_blank_values=True
-    )
-
-    names = sorted({name for name, value in parameters})
-
-    return names
-
-
-def replace_parameter(url, target_parameter, test_value):
-    """Return a URL with one query parameter changed."""
-    parsed = urlsplit(url)
-
-    parameters = parse_qsl(
-        parsed.query,
-        keep_blank_values=True
-    )
-
-    updated_parameters = []
+    raw_parts = parsed.query.split("&") if parsed.query else []
+    updated_parts = []
+    seen_target = 0
     found = False
 
-    for name, value in parameters:
-        if name == target_parameter and not found:
-            updated_parameters.append((name, test_value))
-            found = True
+    for part in raw_parts:
+        raw_name, separator, raw_value = part.partition("=")
+        decoded_name = unquote_plus(raw_name)
+
+        if decoded_name == target_parameter:
+            if seen_target == occurrence_index:
+                # Preserve payload-provided %XX sequences and path separators.
+                # Encode query delimiters so a payload cannot accidentally add
+                # new query parameters or a fragment.
+                encoded_value = quote(test_value, safe="%/\\")
+                updated_parts.append(raw_name + (separator or "=") + encoded_value)
+                found = True
+            else:
+                updated_parts.append(part)
+            seen_target += 1
         else:
-            updated_parameters.append((name, value))
+            updated_parts.append(part)
 
     if not found:
         raise ValueError(
-            f"Parameter '{target_parameter}' was not found"
+            f"Parameter '{target_parameter}' occurrence {occurrence_index + 1} was not found"
         )
 
-    updated_query = urlencode(updated_parameters)
-
+    updated_query = "&".join(updated_parts)
     return urlunsplit((
         parsed.scheme,
         parsed.netloc,
@@ -121,20 +149,24 @@ def load_test_cases(filename):
     return test_cases
 
 
-def generate_test_cases(urls, test_values):
-    """Generate URL variations for each query parameter."""
+def generate_test_cases(urls, test_values, max_payloads_per_parameter=None):
+    """Generate URL variations, optionally limiting values per parameter."""
+    if max_payloads_per_parameter is not None and max_payloads_per_parameter < 1:
+        raise ValueError("max_payloads_per_parameter must be at least 1")
+
+    selected_values = (
+        test_values[:max_payloads_per_parameter]
+        if max_payloads_per_parameter is not None
+        else test_values
+    )
     cases = []
 
     for url in urls:
-        parameters = inspect_url(url)
-
-        for parameter in parameters:
-            for test_value in test_values:
+        for parameter, occurrence_index, occurrence_total in inspect_parameter_instances(url):
+            for test_value in selected_values:
                 try:
                     test_url = replace_parameter(
-                        url,
-                        parameter,
-                        test_value
+                        url, parameter, test_value, occurrence_index=occurrence_index
                     )
                 except ValueError:
                     continue
@@ -142,11 +174,14 @@ def generate_test_cases(urls, test_values):
                 cases.append({
                     "original_url": url,
                     "parameter": parameter,
+                    "parameter_occurrence": occurrence_index + 1,
+                    "parameter_occurrence_total": occurrence_total,
                     "test_value": test_value,
                     "test_url": test_url,
                 })
 
     return cases
+
 class RateLimiter:
     """Space out requests across all worker threads."""
 
@@ -171,17 +206,23 @@ class RateLimiter:
             self.next_request_time = (
                 time.monotonic() + self.interval
             )
-def iter_test_cases(urls, test_values):
-    """Generate test cases one at a time."""
+def iter_test_cases(urls, test_values, max_payloads_per_parameter=None):
+    """Generate URL variations lazily with an optional per-parameter cap."""
+    if max_payloads_per_parameter is not None and max_payloads_per_parameter < 1:
+        raise ValueError("max_payloads_per_parameter must be at least 1")
+
+    selected_values = (
+        test_values[:max_payloads_per_parameter]
+        if max_payloads_per_parameter is not None
+        else test_values
+    )
 
     for url in urls:
-        for parameter in inspect_url(url):
-            for test_value in test_values:
+        for parameter, occurrence_index, occurrence_total in inspect_parameter_instances(url):
+            for test_value in selected_values:
                 try:
                     test_url = replace_parameter(
-                        url,
-                        parameter,
-                        test_value,
+                        url, parameter, test_value, occurrence_index=occurrence_index
                     )
                 except ValueError:
                     continue
@@ -189,9 +230,73 @@ def iter_test_cases(urls, test_values):
                 yield {
                     "original_url": url,
                     "parameter": parameter,
+                    "parameter_occurrence": occurrence_index + 1,
+                    "parameter_occurrence_total": occurrence_total,
                     "test_value": test_value,
                     "test_url": test_url,
                 }
+
+
+def estimate_scan_plan(urls, test_values, max_payloads_per_parameter, max_requests):
+    """Estimate candidate coverage and HTTP request costs without networking.
+
+    A max_requests value of 0 means the request budget is unlimited.
+    """
+    effective_payloads = min(len(test_values), max_payloads_per_parameter)
+    case_counts_by_url = []
+    parameters_discovered = 0
+
+    for url in urls:
+        parameter_count = len(inspect_parameter_instances(url))
+        parameters_discovered += parameter_count
+        case_counts_by_url.append(parameter_count * effective_payloads)
+
+    candidate_cases = sum(case_counts_by_url)
+    baseline_urls = sum(1 for count in case_counts_by_url if count > 0)
+    full_scan_requests = candidate_cases + baseline_urls
+
+    planned_cases = 0
+    urls_started = 0
+    urls_fully_covered = 0
+
+    if max_requests == 0:
+        # Explicit unlimited mode can schedule all candidate cases.
+        planned_cases = candidate_cases
+        urls_started = baseline_urls
+        urls_fully_covered = baseline_urls
+    else:
+        remaining_requests = max_requests
+
+        # Cases are generated URL-by-URL. Each URL with cases costs one
+        # baseline request plus one request per test case.
+        for url_case_count in case_counts_by_url:
+            if url_case_count <= 0:
+                continue
+            if remaining_requests < 2:
+                break
+
+            cases_for_url = min(url_case_count, remaining_requests - 1)
+            if cases_for_url <= 0:
+                break
+
+            urls_started += 1
+            planned_cases += cases_for_url
+            remaining_requests -= cases_for_url + 1
+
+            if cases_for_url == url_case_count:
+                urls_fully_covered += 1
+            else:
+                break
+
+    return {
+        "parameters_discovered": parameters_discovered,
+        "candidate_cases": candidate_cases,
+        "baseline_urls": baseline_urls,
+        "full_scan_requests": full_scan_requests,
+        "planned_cases_under_budget": planned_cases,
+        "urls_started_under_budget": urls_started,
+        "urls_fully_covered_under_budget": urls_fully_covered,
+    }
 
 def fetch_response(
     url,
@@ -419,20 +524,28 @@ def analyze_response(baseline, test):
 
 def run_scan(
     cases,
-    max_requests=50,
+    max_requests=1000,
     timeout=5,
     workers=20,
     expected_marker=None,
     requests_per_second=5,
     allowed_origins=None,
 ):
-    """Yield findings incrementally with bounded concurrency."""
+    """Yield findings with bounded concurrency and one baseline per URL.
+
+    Request accounting reserves one baseline request for each original URL
+    that is actually tested, then one request per test case. Reservations are
+    made before work is submitted, so workers cannot exceed a finite
+    max_requests. Passing 0 explicitly disables the scan-wide budget.
+    """
     if workers < 1:
         raise ValueError("workers must be at least 1")
     if max_requests < 0:
         raise ValueError("max_requests cannot be negative")
     if timeout <= 0:
         raise ValueError("timeout must be greater than 0")
+    if requests_per_second <= 0:
+        raise ValueError("requests_per_second must be greater than 0")
 
     # Never run without an explicit scope. Direct callers default to the
     # local test server; main() supplies the CLI-validated allowlist.
@@ -441,31 +554,84 @@ def run_scan(
     if not allowed_origins:
         raise ValueError("At least one allowed origin is required")
 
-    # Each case uses two requests: baseline and test.
-    max_cases = max_requests // 2
     case_iter = iter(cases)
     limiter = RateLimiter(requests_per_second)
     pending = set()
     submitted = 0
     exhausted = False
+    budget_exhausted = False
 
-    def process_case(case):
+    reservation_lock = Lock()
+    metrics_lock = Lock()
+    baseline_futures = {}
+    reserved_requests = 0
+    requests_attempted = 0
+    baseline_requests_attempted = 0
+
+    def reserve_case(original_url):
+        """Reserve budget and return (baseline future, owns baseline)."""
+        nonlocal reserved_requests
+        with reservation_lock:
+            baseline_future = baseline_futures.get(original_url)
+            if baseline_future is None:
+                # A new URL needs one baseline request plus this test request.
+                if max_requests > 0 and reserved_requests + 2 > max_requests:
+                    return None
+                baseline_future = Future()
+                baseline_futures[original_url] = baseline_future
+                reserved_requests += 2
+                return baseline_future, True
+
+            # This URL's baseline is already reserved or completed.
+            if max_requests > 0 and reserved_requests + 1 > max_requests:
+                return None
+            reserved_requests += 1
+            return baseline_future, False
+
+    def mark_request_attempted(is_baseline):
+        nonlocal requests_attempted, baseline_requests_attempted
+        with metrics_lock:
+            requests_attempted += 1
+            if is_baseline:
+                baseline_requests_attempted += 1
+
+    def process_case(case, baseline_future, owns_baseline):
         original_url = case["original_url"]
         test_url = case["test_url"]
 
-        # Check scope before either request is sent.
+        # Validate scope before any request is sent.
         if not is_allowed_url(original_url, allowed_origins):
             raise ValueError("Original URL is outside the allowed origins")
         if not is_allowed_url(test_url, allowed_origins):
             raise ValueError("Generated test URL is outside the allowed origins")
 
+        if owns_baseline:
+            limiter.wait()
+            mark_request_attempted(is_baseline=True)
+            try:
+                baseline = fetch_response(
+                    original_url,
+                    timeout=timeout,
+                    expected_marker=expected_marker,
+                )
+            except Exception as exc:
+                # Wake any waiting workers and classify this baseline as failed.
+                baseline = {
+                    "status_code": None,
+                    "content_type": "",
+                    "body_bytes_sampled": 0,
+                    "body_sha256": None,
+                    "body_truncated": False,
+                    "expected_marker_found": False,
+                    "elapsed_seconds": None,
+                    "error": str(exc),
+                }
+            baseline_future.set_result(baseline)
+        else:
+            baseline = baseline_future.result()
+
         limiter.wait()
-        baseline = fetch_response(
-            original_url,
-            timeout=timeout,
-            expected_marker=expected_marker,
-        )
-        limiter.wait()
+        mark_request_attempted(is_baseline=False)
         test = fetch_response(
             test_url,
             timeout=timeout,
@@ -484,18 +650,34 @@ def run_scan(
 
     with ThreadPoolExecutor(max_workers=workers) as pool:
         def fill_pending():
-            nonlocal submitted, exhausted
-            while (
-                len(pending) < workers
-                and submitted < max_cases
-                and not exhausted
-            ):
+            nonlocal submitted, exhausted, budget_exhausted
+            while len(pending) < workers and not exhausted:
                 try:
                     case = next(case_iter)
                 except StopIteration:
                     exhausted = True
                     break
-                pending.add(pool.submit(process_case, case))
+
+                original_url = case["original_url"]
+                test_url = case["test_url"]
+                if not is_allowed_url(original_url, allowed_origins):
+                    raise ValueError("Original URL is outside the allowed origins")
+                if not is_allowed_url(test_url, allowed_origins):
+                    raise ValueError("Generated test URL is outside the allowed origins")
+
+                reservation = reserve_case(original_url)
+                if reservation is None:
+                    exhausted = True
+                    budget_exhausted = True
+                    break
+
+                baseline_future, owns_baseline = reservation
+                pending.add(pool.submit(
+                    process_case,
+                    case,
+                    baseline_future,
+                    owns_baseline,
+                ))
                 submitted += 1
 
         fill_pending()
@@ -510,12 +692,22 @@ def run_scan(
             for finding in completed:
                 yield finding
 
+    # Expose counters to main() without changing the yielded finding shape.
+    run_scan.last_stats = {
+        "requests_attempted": requests_attempted,
+        "baseline_requests_attempted": baseline_requests_attempted,
+        "cases_submitted": submitted,
+        "budget_exhausted": budget_exhausted,
+        "reserved_requests": reserved_requests,
+    }
+
 def save_report(
     findings,
     filename="output/findings.json",
     include_all=False,
+    include_review=False,
 ):
-    """Save selected findings to a JSON report."""
+    """Save high-suspicion findings, optionally adding review-level signals."""
     output_path = Path(filename)
     output_path.parent.mkdir(
         parents=True,
@@ -534,8 +726,11 @@ def save_report(
             analysis = finding.get("analysis", {})
             status = analysis.get("status")
 
-            # By default, only save high-suspicion findings.
-            if not include_all and status != "high_suspicion":
+            # Preserve high-suspicion-only defaults; review findings are opt-in.
+            allowed_statuses = {"high_suspicion"}
+            if include_review:
+                allowed_statuses.add("needs_review")
+            if not include_all and status not in allowed_statuses:
                 continue
 
             if not first_item:
@@ -569,7 +764,6 @@ def main():
             "http://127.0.0.1:8000. Can be repeated."
         ),
     )
-
     parser.add_argument(
         "-l", "--list",
         required=True,
@@ -595,7 +789,13 @@ def main():
         "--max-requests",
         type=int,
         default=1000,
-        help="Maximum HTTP requests (default: 1000; two requests per case)",
+        help="Maximum HTTP requests including baselines (default: 1000; use 0 for an explicit unlimited budget)",
+    )
+    parser.add_argument(
+        "--max-payloads-per-parameter",
+        type=int,
+        default=300,
+        help="Maximum test values used per query parameter on each URL (default: 300)",
     )
     parser.add_argument(
         "--timeout",
@@ -612,12 +812,22 @@ def main():
     parser.add_argument(
         "--marker",
         default=None,
-        help="Known harmless marker for controlled test environments",
+        help="Unique expected canary text from a controlled test file; enables marker-based high-suspicion evidence",
+    )
+    parser.add_argument(
+        "--dry-run",
+        action="store_true",
+        help="Show the scan plan without sending HTTP requests or writing a report",
     )
     parser.add_argument(
         "--verbose",
         action="store_true",
         help="Show lower-confidence signals and scan progress",
+    )
+    parser.add_argument(
+        "--include-review",
+        action="store_true",
+        help="Save high-suspicion and needs-review results (without no-difference results)",
     )
     parser.add_argument(
         "--all-findings",
@@ -627,16 +837,19 @@ def main():
 
     args = parser.parse_args()
 
-    # Validate configuration before starting.
     if args.workers < 1:
         parser.error("--workers must be at least 1")
-
     if args.max_requests < 0:
-        parser.error("--max-requests cannot be negative")
-
+        parser.error("--max-requests cannot be negative; use 0 for unlimited")
+    if args.max_requests == 0 and args.allow_origin is None:
+        parser.error(
+            "--max-requests 0 requires at least one explicit --allow-origin. "
+            "Unlimited mode is opt-in; keep the target scope narrow and authorized."
+        )
+    if args.max_payloads_per_parameter < 1:
+        parser.error("--max-payloads-per-parameter must be at least 1")
     if args.timeout <= 0:
         parser.error("--timeout must be greater than 0")
-
     if args.requests_per_second <= 0:
         parser.error("--requests-per-second must be greater than 0")
 
@@ -646,36 +859,30 @@ def main():
 
     if not input_path.is_file():
         parser.error(f"Input file does not exist: {input_path}")
-
     if not test_case_path.is_file():
-        parser.error(
-            f"Test-case file does not exist: {test_case_path}"
-        )
+        parser.error(f"Test-case file does not exist: {test_case_path}")
 
     # Never overwrite the input files with the report.
     resolved_output = output_path.resolve()
-
-    if resolved_output in {
-        input_path.resolve(),
-        test_case_path.resolve(),
-    }:
+    if resolved_output in {input_path.resolve(), test_case_path.resolve()}:
         parser.error("Output path must not overwrite an input file")
 
-    # Load and validate inputs.
-    urls, rejected = load_urls(input_path)
-    test_values = load_test_cases(test_case_path)
+    try:
+        urls, rejected = load_urls(input_path)
+        test_values = load_test_cases(test_case_path)
+    except OSError as exc:
+        parser.error(f"Could not read input: {exc}")
 
     if not urls:
         parser.error("No valid HTTP(S) URLs were found")
-
     if not test_values:
         parser.error("No test values were found")
+
     allowed_origin_strings = (
         args.allow_origin
         if args.allow_origin is not None
         else ["http://127.0.0.1:8000"]
     )
-
     try:
         allowed_origins = {
             normalize_origin(origin)
@@ -688,20 +895,68 @@ def main():
         url for url in urls
         if not is_allowed_url(url, allowed_origins)
     ]
-
     if blocked_urls:
         parser.error(
-            f"{len(blocked_urls)} URL(s) are outside the "
-            "allowed origins. No scan was started. "
-            "Check --allow-origin and your input file."
+            f"{len(blocked_urls)} URL(s) are outside the allowed origins. "
+            "No scan was started. Check --allow-origin and your input file."
         )
 
-    # Estimate the number of candidate cases without generating
-    # and storing every case.
-    potential_cases = (
-        sum(len(inspect_url(url)) for url in urls)
-        * len(test_values)
+    plan = estimate_scan_plan(
+        urls,
+        test_values,
+        args.max_payloads_per_parameter,
+        args.max_requests,
     )
+    effective_payloads = min(
+        len(test_values), args.max_payloads_per_parameter
+    )
+
+    print(
+        f"[PathFuzz] Loaded {len(urls)} unique URLs; "
+        f"rejected lines: {rejected}"
+    )
+    print(f"[PathFuzz] Query parameters discovered: {plan['parameters_discovered']}")
+    print(
+        f"[PathFuzz] Configured test values: {len(test_values)}; "
+        f"limit per parameter: {args.max_payloads_per_parameter}; "
+        f"values used per parameter: {effective_payloads}"
+    )
+    print(f"[PathFuzz] Candidate cases after cap: {plan['candidate_cases']}")
+    print(
+        f"[PathFuzz] Estimated requests for a complete scan: "
+        f"{plan['full_scan_requests']} "
+        f"({plan['baseline_urls']} baseline + {plan['candidate_cases']} tests)"
+    )
+    budget_label = (
+        "unlimited (explicit opt-in)"
+        if args.max_requests == 0
+        else str(args.max_requests)
+    )
+    print(
+        f"[PathFuzz] Request budget: {budget_label}; "
+        f"estimated cases schedulable: {plan['planned_cases_under_budget']}"
+    )
+
+    if args.dry_run:
+        print("[DRY RUN] No HTTP requests sent; no report written.")
+        if plan["candidate_cases"] > plan["planned_cases_under_budget"]:
+            print(
+                f"[DRY RUN] The current budget would leave "
+                f"{plan['candidate_cases'] - plan['planned_cases_under_budget']} "
+                "candidate cases untested."
+            )
+        return
+
+    if plan["candidate_cases"] == 0:
+        print("[PathFuzz] No query parameters found; nothing to test.")
+        return
+
+    if args.marker is None:
+        print(
+            "[Info] No canary marker supplied. Marker-based high-suspicion evidence "
+            "is unavailable. Use --include-review or --all-findings to save "
+            "response-difference signals in the report."
+        )
 
     stats = {
         "processed": 0,
@@ -710,29 +965,12 @@ def main():
         "inconclusive": 0,
         "no_obvious_difference": 0,
     }
-
-    print(
-        f"[PathFuzz] Loaded {len(urls)} unique URLs; "
-        f"rejected lines: {rejected}"
-    )
-    print(
-        f"[PathFuzz] Candidate cases: {potential_cases}; "
-        f"workers: {args.workers}; "
-        f"request budget: {args.max_requests}"
-    )
-
-    if args.marker is None:
-        print(
-            "[Info] Marker-based high-suspicion detection is disabled. "
-            "Use --marker with a known harmless marker in a "
-            "controlled test environment."
-        )
-
     started_at = time.monotonic()
-
-    # Generate cases lazily and process results as they arrive.
-    cases = iter_test_cases(urls, test_values)
-
+    cases = iter_test_cases(
+        urls,
+        test_values,
+        max_payloads_per_parameter=args.max_payloads_per_parameter,
+    )
     findings_stream = run_scan(
         cases,
         max_requests=args.max_requests,
@@ -741,96 +979,88 @@ def main():
         expected_marker=args.marker,
         requests_per_second=args.requests_per_second,
         allowed_origins=allowed_origins,
-
     )
 
     def observed_findings():
         """Print selected results while streaming them to the report."""
-
         for finding in findings_stream:
             stats["processed"] += 1
-
             analysis = finding.get("analysis", {})
             status = analysis.get("status", "unknown")
             reasons = analysis.get("reasons", [])
-
             if status in stats:
                 stats[status] += 1
 
             # Avoid printing query strings, which may contain tokens.
             parsed = urlsplit(finding["original_url"])
             safe_netloc = parsed.netloc.rsplit("@", 1)[-1]
-            safe_target = (
-                f"{parsed.scheme}://{safe_netloc}{parsed.path}"
-            )
+            safe_target = f"{parsed.scheme}://{safe_netloc}{parsed.path}"
             parameter = finding.get("parameter", "<unknown>")
+            occurrence = finding.get("parameter_occurrence", 1)
+            occurrence_total = finding.get("parameter_occurrence_total", 1)
+            parameter_label = (
+                f"{parameter} (occurrence {occurrence}/{occurrence_total})"
+                if occurrence_total > 1
+                else parameter
+            )
 
             if status == "high_suspicion":
                 print(f"\n[HIGH SUSPICION] {safe_target}")
-                print(f"  Parameter: {parameter}")
+                print(f"  Parameter: {parameter_label}")
                 print(f"  Evidence: {', '.join(reasons)}")
-
-            elif args.verbose and status in {
-                "needs_review",
-                "inconclusive",
-            }:
+            elif args.verbose and status in {"needs_review", "inconclusive"}:
                 print(f"\n[{status.upper()}] {safe_target}")
-                print(f"  Parameter: {parameter}")
+                print(f"  Parameter: {parameter_label}")
                 print(f"  Reasons: {', '.join(reasons)}")
 
-            if (
-                args.verbose
-                and stats["processed"] % 500 == 0
-            ):
-                print(
-                    f"[Progress] Processed "
-                    f"{stats['processed']} cases"
-                )
-
+            if args.verbose and stats["processed"] % 500 == 0:
+                print(f"[Progress] Processed {stats['processed']} cases")
             yield finding
 
-    # save_report consumes the stream incrementally.
-    # Default: save high-suspicion findings only.
     saved_count = save_report(
         observed_findings(),
         filename=str(output_path),
         include_all=args.all_findings,
+        include_review=args.include_review,
     )
-
     elapsed = time.monotonic() - started_at
+    run_stats = getattr(run_scan, "last_stats", {})
+    requests_attempted = run_stats.get("requests_attempted", 0)
+    baseline_requests = run_stats.get("baseline_requests_attempted", 0)
 
     print(f"\n{'=' * 40}")
     print("PathFuzz scan summary")
     print(f"{'=' * 40}")
-    print(f"URLs loaded:               {len(urls)}")
-    print(f"Input lines rejected:      {rejected}")
-    print(f"Candidate cases:           {potential_cases}")
-    print(f"Cases processed:           {stats['processed']}")
-    print(f"HTTP requests attempted:   {stats['processed'] * 2}")
-    print(f"High suspicion:            {stats['high_suspicion']}")
-    print(f"Needs review:              {stats['needs_review']}")
-    print(f"Inconclusive:              {stats['inconclusive']}")
-    print(
-        f"No obvious difference:     "
-        f"{stats['no_obvious_difference']}"
-    )
-    print(f"Elapsed time:              {elapsed:.2f} seconds")
-    print(f"Findings saved:            {saved_count}")
-    print(f"Report path:               {output_path}")
+    print(f"URLs loaded:                    {len(urls)}")
+    print(f"Input lines rejected:           {rejected}")
+    print(f"Candidate cases after cap:      {plan['candidate_cases']}")
+    print(f"Cases processed:                {stats['processed']}")
+    print(f"Baseline requests attempted:    {baseline_requests}")
+    print(f"Test requests attempted:        {stats['processed']}")
+    print(f"HTTP requests attempted:        {requests_attempted}")
+    print(f"High suspicion:                 {stats['high_suspicion']}")
+    print(f"Needs review:                   {stats['needs_review']}")
+    print(f"Inconclusive:                   {stats['inconclusive']}")
+    print(f"No obvious difference:          {stats['no_obvious_difference']}")
+    print(f"Elapsed time:                   {elapsed:.2f} seconds")
+    print(f"Findings saved:                 {saved_count}")
+    print(f"Report path:                    {output_path}")
 
-    if stats["processed"] < potential_cases:
-        remaining = potential_cases - stats["processed"]
+    if args.max_requests > 0 and stats["processed"] < plan["candidate_cases"]:
+        remaining = plan["candidate_cases"] - stats["processed"]
         print(
-            f"\n[Request budget reached] "
+            f"\n[Request budget or scan limit reached] "
             f"{remaining} candidate cases were not processed."
         )
         print(
-            "Increase --max-requests only when permitted by "
-            "the target's authorization and rate limits."
+            "Increase --max-requests only within the target's explicit "
+            "authorization and rate limits."
         )
 
     if args.all_findings:
         print("Report mode: all findings")
+    elif args.include_review:
+        print("Report mode: high-suspicion and needs-review findings")
     else:
         print("Report mode: high-suspicion findings only")
 
